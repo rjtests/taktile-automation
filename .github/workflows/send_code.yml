@@ -1,0 +1,194 @@
+name: Send Python Code to API
+
+on:
+  workflow_call:
+    inputs:
+      ORG_NAME:
+        required: true
+        type: string
+    secrets:
+      API_KEY:
+        required: true
+
+jobs:
+  send_code_to_api:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v3
+
+      - name: Check API Key
+        run: |
+          if [ -z "${{ secrets.API_KEY }}" ]; then
+            echo "ERROR: API_KEY is missing from GitHub Secrets"
+            exit 1
+          else
+            echo "API_KEY is properly set"
+          fi
+
+      - name: Check ORG_NAME
+        run: |
+          if [ -z "${{ inputs.ORG_NAME }}" ]; then
+            echo "ERROR: ORG_NAME is missing from workflow inputs"
+            exit 1
+          else
+            echo "ORG_NAME is properly set"
+          fi          
+
+      - name: Read all Python files and store them as strings dynamically
+        run: |
+          echo "Searching for Python files..."
+
+          # Lists all .py files in the repository
+          PYTHON_FILES=$(find . -maxdepth 1 -type f -name "*.py" | xargs -n 1 basename | tr '\n' ' ')
+
+          # If no .py files are found, display an error and stop the workflow
+          if [ -z "$PYTHON_FILES" ]; then
+            echo "ERROR: No Python files found"
+            exit 1
+          fi
+
+          echo "Found Python files: $PYTHON_FILES"
+
+          # Storing the file names
+          echo "PYTHON_FILES=${PYTHON_FILES}" >> $GITHUB_ENV
+
+          # Loop to read and store the content of each file
+          for file in $PYTHON_FILES; do
+            FILE_NAME=$(basename "$file" .py | tr '[:lower:]' '[:upper:]')
+            echo "Processing file: $file → Stored as ${FILE_NAME}_CODE"
+
+            FILE_CONTENT=$(cat "$file" | sed ':a;N;$!ba;s/\r//g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
+            # FILE_CONTENT=$(cat "$file")
+
+            # If the file is empty, display a warning but continue the workflow
+            if [[ -z "$FILE_CONTENT" ]]; then
+              echo "WARNING: File $file is empty!"
+              continue
+            fi
+
+            # Save each code snippet in the GitHub Actions environment with a dynamic name
+            echo "${FILE_NAME}_CODE=${FILE_CONTENT}" >> $GITHUB_ENV
+          done
+
+      - name: Send code to API
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          ORG_NAME: ${{ inputs.ORG_NAME }}
+          PYTHON_FILES: ${{ env.PYTHON_FILES }}
+        run: |
+          python - <<EOF
+          import http.client
+          import json
+          import os
+
+          # API configuration
+          API_HOST = "eu-central-1.taktile-org.decide.taktile.com"
+          ENDPOINT_LIST_FLOWS = "/run/api/v1/flows/list-decision-graphs/sandbox/decide"
+          ENDPOINT_GET_GRAPH = "/run/api/v1/flows/get-decision-graph/sandbox/decide"
+          ENDPOINT_UPDATE = "/run/api/v1/flows/patch-decision-graph/sandbox/decide"
+
+          api_key = os.getenv("API_KEY")
+          if not api_key:
+              raise ValueError("ERROR: API_KEY is empty")
+
+          org_name = os.getenv("ORG_NAME")
+          if not api_key:
+              raise ValueError("ERROR: ORG_NAME is empty")
+
+          headers = {
+              "X-Api-Key": api_key,
+              "accept": "application/json",
+              "Content-Type": "application/json"
+          }
+
+          # Create connection
+          conn = http.client.HTTPSConnection(API_HOST)
+
+          # Defining functions to get flow_id, node_id from code_nodes by name
+          def flow_ids(org_name):
+              """Retrieve all flow_id from the organization."""
+              payload = json.dumps({
+                  "data": {"organization_name": org_name},
+                  "metadata": {"version": "v1.0", "entity_id": "string"},
+                  "control": {"execution_mode": "sync"}
+              })
+              conn.request("POST", ENDPOINT_LIST_FLOWS, payload, headers)
+              res = conn.getresponse()
+              data = res.read()
+              response_json = json.loads(data.decode("utf-8"))
+              list_decision_flows=dict(response_json)
+              flow_ids =[]
+              for i in range(len(list_decision_flows['data']['flows'])):
+                  flow_ids.append(list_decision_flows['data']['flows'][i]['flow_id'])
+              return flow_ids
+
+          def node_ids(org_name):
+              """Retrieve all node_id from the code_nodes of each flow"""
+              flows = flow_ids(org_name)
+              ans = {}
+              for flow_id in flows:
+                  payload = json.dumps({
+                      "data": {"flow_id": flow_id},
+                      "metadata": {"version": "v1.0", "entity_id": "string"},
+                      "control": {"execution_mode": "sync"}
+                  })
+                  conn.request("POST", ENDPOINT_GET_GRAPH, payload, headers)
+                  res = conn.getresponse()
+                  data = res.read()
+                  response_json = json.loads(data.decode("utf-8"))
+                  get_decision_flows=dict(response_json)
+                  for i in range(len(get_decision_flows['data']['graph'])):
+                      if get_decision_flows['data']['graph'][i]['node_type']=='code_node':
+                          node_id = get_decision_flows['data']['graph'][i]['node_id']
+                          if get_decision_flows['data']['graph'][i]['node_name'].lower() in ans:
+                              ans[get_decision_flows['data']['graph'][i]['node_name'].lower()].append((flow_id,node_id))
+                          else:
+                              ans[get_decision_flows['data']['graph'][i]['node_name'].lower()] = [(flow_id,node_id)]
+
+              return ans
+          
+          # Node codes available
+          nodes_available = node_ids(org_name)
+
+          # List of detected files
+          python_files = os.getenv("PYTHON_FILES", "").split()
+          if not python_files:
+              raise ValueError("ERROR: No Python files found!")
+
+          print(f"Found Python files: {python_files}")
+
+          # Finding flow_id and node_id for each file name = code name
+          for file_name in python_files:
+              name = f"{file_name.replace('.py', '').lower()}"
+              env_var = f"{file_name.replace('.py', '').upper()}_CODE"
+              src_code = os.getenv(env_var)
+              src_code = str(src_code).replace('\\n', '\n').replace('\"', "'")
+              aux = nodes_available[name]
+              for i in range(len(aux)):
+                  flow_id = aux[i][0]
+                  node_id = aux[i][1]
+                  payload = json.dumps({
+                      "data": {
+                          "flow_id": flow_id,
+                          "node_id": node_id,
+                          "src_code": src_code
+                      },
+                      "metadata": {
+                          "version": "v1.0",
+                          "entity_id": "string"
+                      },
+                      "control": {
+                          "execution_mode": "sync"
+                      }
+                  })
+    
+                  print(f"Sending {file_name} (flow_id: {flow_id}, node_id: {node_id}) to API...")
+                  conn.request("POST", ENDPOINT_UPDATE, payload, headers)
+                  res = conn.getresponse()
+                  data = res.read()
+                  print(data.decode("utf-8"))
+
+          print("All files processed!")
+          EOF
